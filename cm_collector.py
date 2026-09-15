@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.getLogger("paramiko").setLevel(logging.WARNING)
+log = logging.getLogger('cm_collector')
 
 try:
     from kafka import KafkaConsumer
@@ -47,7 +48,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _load_env():
-    """Load key=value pairs from .env in the script directory into os.environ."""
+    """Load key=value pairs from .env in the script directory into os.environ.
+    Always overrides existing env vars so the .env file is the source of truth.
+    """
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if not os.path.exists(env_path):
         return
@@ -57,7 +60,7 @@ def _load_env():
             if not line or line.startswith('#') or '=' not in line:
                 continue
             k, _, v = line.partition('=')
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ[k.strip()] = v.strip()
 
 _load_env()
 
@@ -84,6 +87,7 @@ DEFAULT_RESULTS_DIR         = _e('RESULTS_DIR', 'results')
 # Kafka metrics (vCMTS only)
 # ---------------------------------------------------------------------------
 KAFKA_METRICS = {
+    # flow counters (mapped → CSV columns)
     'dp_flow_QueueLatencyMaxUsec',
     'dp_flow_QueueLatencyAvgUsec',
     'dp_flow_QueueLatencyBinPktCount',
@@ -93,18 +97,11 @@ KAFKA_METRICS = {
     'K_Samis1_DeltaPacketsPassed',
     'K_Samis1_DeltaOctetsPassed',
     'K_Samis1_DeltaPacketsDropped',
-    'K_Samis1_ServiceTimeCreated',
     'snmp_docsQosServiceFlowPackets',
     'snmp_docsQosServiceFlowOctets',
+    # sfid + params (handled explicitly, not via _KAFKA_METRIC_MAP)
     'K_DocsQos_Params',
-    'K_CmDhcp_Options',
-    'K_CmRegStatus_RegStatus',
-    'K_CmRegStatus_Capabilities',
     'K_Samis1_Sfid',
-    'K_Samis1_RecType',
-    'K_Samis1_ServiceFlowChSet',
-    'sched_Flow_SfId',
-    'sched_Flow_primarySid',
 }
 
 KAFKA_CSV_FIELDS = [
@@ -128,12 +125,21 @@ KAFKA_CSV_FIELDS = [
     'max_rate_bps', 'aqm_target_msecs',
 ]
 
+# Counter fields that accumulate — deltas are computed between polls
+SNMP_DELTA_COUNTER_FIELDS = [
+    'flow_pkts', 'flow_octets', 'flow_policed_drop', 'flow_policed_delay', 'flow_aqm_drop',
+    'lat_updates',
+    'lat_bin1', 'lat_bin2', 'lat_bin3', 'lat_bin4', 'lat_bin5', 'lat_bin6', 'lat_bin7', 'lat_bin8',
+    'lat_bin9', 'lat_bin10', 'lat_bin11', 'lat_bin12', 'lat_bin13', 'lat_bin14', 'lat_bin15', 'lat_bin16',
+    'cong_sanctioned', 'cong_ect0', 'cong_ect1', 'cong_ce_marked', 'cong_arrived_ce',
+]
+
 SNMP_CSV_FIELDS = [
-    'captured_utc', 'poll_index', 'target_ip', 'target_label', 'cmts_type', 'sfid',
-    # .3 SF Table
-    'sf_direction', 'sf_primary', 'sf_agg_sfid', 'sf_buffer_size',
+    'captured_utc', 'poll_index', 'phase', 'target_ip', 'target_label', 'cmts_type', 'sfid',
+    # .3 SF Table (buffer size only — direction/primary/sid/agg not supported on vCMTS modem)
+    'sf_buffer_size',
     # .2 Param Set (active)
-    'ps_scn', 'ps_priority', 'ps_max_rate', 'ps_max_rate_64', 'ps_max_burst',
+    'ps_scn', 'ps_priority', 'ps_max_rate', 'ps_max_burst',
     'ps_max_concat_burst', 'ps_aqm_latency_target',
     'ps_min_buffer', 'ps_target_buffer', 'ps_max_buffer',
     # .4 Flow Stats
@@ -148,20 +154,52 @@ SNMP_CSV_FIELDS = [
     'lat_max_usec', 'lat_updates',
     'lat_bin1', 'lat_bin2', 'lat_bin3', 'lat_bin4', 'lat_bin5', 'lat_bin6', 'lat_bin7', 'lat_bin8',
     'lat_bin9', 'lat_bin10', 'lat_bin11', 'lat_bin12', 'lat_bin13', 'lat_bin14', 'lat_bin15', 'lat_bin16',
-    # .30 Congestion
-    'cong_aqm_drop', 'cong_scn_marked', 'cong_ce_marked', 'cong_sanctioned', 'cong_ect0', 'cong_ect1', 'cong_ce_ect1', 'cong_arrived_ce',
+    # .30 Congestion  (order matches OID .30.1.1–.30.1.5)
+    'cong_sanctioned', 'cong_ect0', 'cong_ect1', 'cong_ce_marked', 'cong_arrived_ce',
 ]
+
+# Delta CSV adds delta_ columns after the raw counters
+SNMP_DELTA_CSV_FIELDS = SNMP_CSV_FIELDS + [f'delta_{f}' for f in SNMP_DELTA_COUNTER_FIELDS]
+
+# ---------------------------------------------------------------------------
+# SNMP delta computation
+# ---------------------------------------------------------------------------
+
+# Module-level store: (session_id, target_label, sfid) → {field: int}
+_snmp_prev: dict = {}
+
+
+def _compute_snmp_deltas(rows, session_id=''):
+    """Augment each row with delta_<field> columns for all counter fields.
+    Skips negative deltas (counter reset / SFID reuse) per project convention.
+    Mutates rows in-place and returns them.
+    """
+    for row in rows:
+        key = (session_id, row.get('target_label', ''), row.get('sfid', ''))
+        prev = _snmp_prev.get(key, {})
+        for field in SNMP_DELTA_COUNTER_FIELDS:
+            raw = row.get(field, '')
+            try:
+                cur = int(raw)
+            except (TypeError, ValueError):
+                row[f'delta_{field}'] = ''
+                continue
+            if field in prev:
+                delta = cur - prev[field]
+                row[f'delta_{field}'] = '' if delta < 0 else str(delta)
+            else:
+                row[f'delta_{field}'] = ''  # first poll — no prior value
+            prev[field] = cur
+        _snmp_prev[key] = prev
+    return rows
+
 
 # OID column index → CSV field name, keyed by col_path after stripping index suffix
 # For most tables: col_path = strip last 2 (ifindex + sfid)
 # For .2 param set: col_path = strip last 3 (ifindex + paramset_type + sfid), only type=2
 _OID_COL_MAP = {
-    # .3 SF Table — cols returned: 7=direction, 8=primary, 19=asfId
-    '3.1.7':  'sf_direction',
-    '3.1.8':  'sf_primary',
-    '3.1.19': 'sf_agg_sfid',
-    # .3.1.17 buffer size (strip 2)
-    '3.1.17': 'sf_buffer_size',
+    # .3 SF Table
+    '3.1.17': 'sf_buffer_size',  # docsQosServiceFlowBufferSize (still walked via .4 pivot)
     # .4 Flow Stats
     '4.1.1':  'flow_pkts',
     '4.1.2':  'flow_octets',
@@ -205,15 +243,12 @@ _OID_COL_MAP = {
     '29.2.1.16': 'lat_bin14',
     '29.2.1.17': 'lat_bin15',
     '29.2.1.18': 'lat_bin16',
-    # .30 Congestion
-    '30.1.1': 'cong_aqm_drop',
-    '30.1.2': 'cong_scn_marked',
-    '30.1.3': 'cong_ce_marked',
-    '30.1.4': 'cong_sanctioned',
-    '30.1.5': 'cong_ect0',
-    '30.1.6': 'cong_ect1',
-    '30.1.7': 'cong_ce_ect1',
-    '30.1.8': 'cong_arrived_ce',
+    # .30 Congestion  (docsQosSfCongestion table — verified against OID JSON)
+    '30.1.1': 'cong_sanctioned',   # docsQosSfCongestionSanctionedPkts
+    '30.1.2': 'cong_ect0',         # docsQosSfCongestionTotalEct0Pkts
+    '30.1.3': 'cong_ect1',         # docsQosSfCongestionTotalEct1Pkts
+    '30.1.4': 'cong_ce_marked',    # docsQosSfCongestionCeMarkedEct1Pkts
+    '30.1.5': 'cong_arrived_ce',   # docsQosSfCongestionArrivedCePkts
 }
 
 # .2 Param Set Table — strip last 3 (ifindex + paramset_type + sfid), only type=2 (active)
@@ -227,7 +262,6 @@ _OID_PARAM_MAP = {
     '2.1.40': 'ps_target_buffer',
     '2.1.41': 'ps_max_buffer',
     '2.1.43': 'ps_aqm_latency_target',
-    '2.1.44': 'ps_max_rate_64',
 }
 
 _RE_OID_SFID = re.compile(r'21\.1\.(\d+(?:\.\d+)*)\s*=\s*\S+:\s*(.*)')
@@ -255,16 +289,15 @@ def _pivot_results(results, ts, poll_idx, target_ip, target_label, cmts_type):
             if not m:
                 continue
             parts = m.group(1).split('.')
-            val   = m.group(2).strip()
+            val   = m.group(2).strip().strip('"')
 
-            # .2 param set table: index is col.ifindex.paramset_type.sfid (strip 3)
-            if parts[0] == '2' and len(parts) >= 5:
-                sfid         = parts[-1]
-                paramset_type = parts[-2]
-                if paramset_type != '2':   # only active param set
-                    continue
-                col_path = '.'.join(parts[:-3])
-                field = _OID_PARAM_MAP.get(col_path)
+            # .2 param set: targeted walks return col.2.ifindex.sfid
+            # The .2 (active type) is already in the OID prefix walked,
+            # so accept both the old full form and the new targeted form.
+            if parts[0] == '2' and len(parts) >= 3:
+                sfid = parts[-1]
+                field = _OID_PARAM_MAP.get('.'.join(parts[:-3])) or \
+                        _OID_PARAM_MAP.get('.'.join(parts[:-2]))
                 if field:
                     _get_or_create(sfid)[field] = val
                 continue
@@ -343,45 +376,78 @@ def _get_ssh(jumpserver, username):
     return ssh
 
 def _run_local(cmds, lbls):
-    """Run SNMP commands locally via subprocess, return [(label, output), ...]."""
+    """Run SNMP commands locally in parallel (2 workers) via subprocess."""
     import subprocess
-    results = []
-    for label, cmd in zip(lbls, cmds):
-        print(f'  … {label}', flush=True)
-        try:
-            proc = subprocess.run(cmd, shell=True, capture_output=True, timeout=300)
-            stdout = proc.stdout.decode(errors='replace')
-            stderr = proc.stderr.decode(errors='replace').strip()
-            if proc.returncode != 0 and not stdout:
-                print(f'  ✗ [{label}] exit={proc.returncode}  {stderr or "(no output)"}')
-            elif stderr:
-                print(f'  ⚠ [{label}] stderr: {stderr}')
-            results.append((label, stdout))
-        except subprocess.TimeoutExpired:
-            print(f'  ✗ [{label}] timed out after 300s')
-            results.append((label, ''))
-        except Exception as e:
-            print(f'  ✗ [{label}] failed: {e}')
-            results.append((label, ''))
-    return results
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    mid = (len(cmds) + 1) // 2
+    batches = [(cmds[:mid], lbls[:mid]), (cmds[mid:], lbls[mid:])]
+
+    def _run_batch(batch_cmds, batch_lbls):
+        results = []
+        for label, cmd in zip(batch_lbls, batch_cmds):
+            print(f'  … {label}', flush=True)
+            try:
+                proc = subprocess.run(cmd, shell=True, capture_output=True, timeout=300)
+                stdout = proc.stdout.decode(errors='replace')
+                stderr = proc.stderr.decode(errors='replace').strip()
+                if proc.returncode != 0 and not stdout:
+                    print(f'  ✗ [{label}] exit={proc.returncode}  {stderr or "(no output)"}')
+                elif stderr:
+                    print(f'  ⚠ [{label}] stderr: {stderr}')
+                results.append((label, stdout))
+            except subprocess.TimeoutExpired:
+                print(f'  ✗ [{label}] timed out after 300s')
+                results.append((label, ''))
+            except Exception as e:
+                print(f'  ✗ [{label}] failed: {e}')
+                results.append((label, ''))
+        return results
+
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [ex.submit(_run_batch, bc, bl) for bc, bl in batches if bc]
+        for fut in as_completed(futures):
+            for label, out in fut.result():
+                results_map[label] = out
+    return [(lbl, results_map.get(lbl, '')) for lbl in lbls]
 
 
-def _run_via_ssh(ssh, cmds, lbls):
-    """Run SNMP commands on jump server via SSH, return [(label, output), ...]."""
-    results = []
-    for label, cmd in zip(lbls, cmds):
-        print(f'  … {label}', flush=True)
+def _run_via_ssh(jumpserver, username, cmds, lbls):
+    """Run SNMP commands using 2 SSH connections in parallel — commands split evenly."""
+    mid = (len(cmds) + 1) // 2
+    batches = [(cmds[:mid], lbls[:mid]), (cmds[mid:], lbls[mid:])]
+
+    def _run_batch(batch_cmds, batch_lbls):
+        conn = _ssh_connect(jumpserver, username)
+        results = []
         try:
-            _, stdout, stderr = ssh.exec_command(cmd)
-            out = stdout.read().decode(errors='replace')
-            err = stderr.read().decode(errors='replace').strip()
-            if not out and err:
-                print(f'  ✗ [{label}] {err}')
-            results.append((label, out))
-        except Exception as e:
-            print(f'  ✗ [{label}] failed: {e}')
-            results.append((label, ''))
-    return results
+            for label, cmd in zip(batch_lbls, batch_cmds):
+                print(f'  … {label}', flush=True)
+                try:
+                    _, stdout, stderr = conn.exec_command(cmd)
+                    out = stdout.read().decode(errors='replace')
+                    err = stderr.read().decode(errors='replace').strip()
+                    if not out and err:
+                        print(f'  ✗ [{label}] {err}')
+                    results.append((label, out))
+                except Exception as e:
+                    print(f'  ✗ [{label}] failed: {e}')
+                    results.append((label, ''))
+        finally:
+            conn.close()
+        return results
+
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [ex.submit(_run_batch, bc, bl) for bc, bl in batches if bc]
+        for fut in as_completed(futures):
+            try:
+                for label, out in fut.result():
+                    results_map[label] = out
+            except Exception as e:
+                print(f'  ✗ batch failed: {e}')
+    return [(lbl, results_map.get(lbl, '')) for lbl in lbls]
 
 def _parse_snmp_output(output):
     rows = []
@@ -444,23 +510,31 @@ def _icmts_snmp_commands(icmts_ip, modem_ip, icmts_community, modem_community, t
         'DS Cadant Map Stats',    # channel-level, not per-modem
         'DS Map Stats Pages Flows',
     ]
+    base = f'snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip}'
+    # Walk only the specific active (type=2) param-set columns needed instead of
+    # the entire .21.1.2 subtree (54+ columns × 3 param-set types × all SFIDs).
+    param_oids = [
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.4.2',   # ps_scn
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.5.2',   # ps_priority
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.6.2',   # ps_max_rate
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.7.2',   # ps_max_burst
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.8.2',   # ps_max_concat_burst
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.39.2',  # ps_min_buffer
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.40.2',  # ps_target_buffer
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.41.2',  # ps_max_buffer
+        '1.3.6.1.4.1.4491.2.1.21.1.2.1.43.2',  # ps_aqm_latency_target
+    ]
     us_cmds = [
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.3",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.3.1.19",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.2",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.8",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.4",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.29.1",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.29.2",
-        f"snmpwalk -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} 1.3.6.1.4.1.4491.2.1.21.1.30",
+        ' && '.join(f"{base} {o}" for o in param_oids),
+        f"{base} 1.3.6.1.4.1.4491.2.1.21.1.4",
+        f"{base} 1.3.6.1.4.1.4491.2.1.21.1.29.1",
+        f"{base} 1.3.6.1.4.1.4491.2.1.21.1.29.2",
+        f"{base} 1.3.6.1.4.1.4491.2.1.21.1.30",
         f"snmpbulkget -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} .1.3.6.1.4.1.4998.1.1.15.10.2",
         f"snmpbulkget -v 2c -c {modem_community} -t {t} -r {r} {modem_ip} .1.3.6.1.4.1.4998.1.1.15.10.8",
     ]
     us_lbls = [
-        'US SF Table',              # direction, primary, SID, time created, buffer size
-        'US Aggregate SFID Map',    # SFID → ASF parent (.3.1.19)
-        'US Param Set Table',       # SCN, priority, rates, buffers, AQM target
-        'US Service Class Names',   # service class name table
+        'US Param Set Table',       # SCN, priority, rates, buffers, AQM target (active only)
         'US Flow Stats Table',      # pkts, octets, policed drop/delay, AQM drop
         'US Latency Bin Edges',     # bin edge config (.29.1)
         'US Latency Stats Table',   # per-bin pkt counts + max latency (.29.2)
@@ -485,10 +559,11 @@ _LATENCY_COLS = [
 
 # col index → (label, width) for .30 congestion summary
 _CONGESTION_COLS = [
-    ('1', 'AQMDrops',   10),
-    ('2', 'SCNMarked',  10),
-    ('3', 'CEMarked',   10),
-    ('4', 'Sanctioned', 12),
+    ('1', 'Sanctioned', 12),
+    ('2', 'ECT0',       10),
+    ('3', 'ECT1',       10),
+    ('4', 'CEMarked',   10),
+    ('5', 'ArrivedCE',  10),
 ]
 
 # .4 flow stats: col 1=Pkts, 2=Octets, 6=PolicedDrop, 7=PolicedDelay, 8=AQMDrop
@@ -595,6 +670,68 @@ def _filter_by_sfids(output, sfids):
                 if re.search(r'\.(' + '|'.join(sfids) + r')\s*=', line)]
     return '\n'.join(filtered) if filtered else output
 
+
+def _extract_sfid_ifindex(sf_index_output, mac_decimal):
+    """Extract {sfid: ifindex} for this modem from SF Index Table output.
+    OID format: ...11.1.3.<mac_decimal>.<sfid> = INTEGER: <ifIndex>
+    """
+    result = {}
+    for line in sf_index_output.splitlines():
+        if mac_decimal and mac_decimal not in line:
+            continue
+        m = re.search(re.escape(mac_decimal) + r'\.(\d+)\s*=\s*\S+:\s*(\d+)', line)
+        if m:
+            result[m.group(1)] = m.group(2)
+    return result
+
+
+def _pivot_results_ds(results, ts, poll_idx, target_ip, cmts_type, sfid_ifindex):
+    """Parse DS SNMP results and return rows filtered to modem SFIDs via inner join.
+    sfid_ifindex: {sfid: ifindex} from _extract_sfid_ifindex.
+    Only rows whose (ifindex, sfid) match the modem's SF table are kept.
+    """
+    # Build reverse map: ifindex -> set of sfids for this modem
+    ifindex_sfids = {}
+    for sfid, ifindex in sfid_ifindex.items():
+        ifindex_sfids.setdefault(ifindex, set()).add(sfid)
+
+    sfid_rows = {}
+
+    def _get_or_create(sfid):
+        if sfid not in sfid_rows:
+            sfid_rows[sfid] = {
+                'captured_utc': ts, 'poll_index': poll_idx,
+                'target_ip': target_ip, 'target_label': 'icmts_ds',
+                'cmts_type': cmts_type, 'sfid': sfid,
+            }
+        return sfid_rows[sfid]
+
+    for _label, output in results:
+        if _label == 'DS SF Index Table':
+            continue
+        for line in output.splitlines():
+            m = _RE_OID_SFID.search(line)
+            if not m:
+                continue
+            parts = m.group(1).split('.')
+            val   = m.group(2).strip().strip('"')
+            if len(parts) < 3:
+                continue
+            sfid    = parts[-1]
+            ifindex = parts[-2]
+            # Inner join: only keep if (ifindex, sfid) matches this modem
+            if sfid not in sfid_ifindex or sfid_ifindex[sfid] != ifindex:
+                continue
+            # Latency .29: filter to A==2 rows (stats, not bin edges)
+            col_path = '.'.join(parts[:-2])
+            if col_path.startswith('29.') and parts[0] != '2':
+                continue
+            field = _OID_COL_MAP.get(col_path)
+            if field:
+                _get_or_create(sfid)[field] = val
+
+    return list(sfid_rows.values())
+
 # ---------------------------------------------------------------------------
 # CMTS modem info collector (SSH jump → CMTS CLI)
 # ---------------------------------------------------------------------------
@@ -632,11 +769,18 @@ def _run_cmts_command(ssh, cmts_host, username, password, cmd):
     """Open interactive shell on jump server, SSH to CMTS, run one command."""
     shell = ssh.invoke_shell()
     shell.send(f'ssh -o StrictHostKeyChecking=no {username}@{cmts_host}\n')
-    time.sleep(1.5)
-    buf = shell.recv(8192).decode(errors='replace')
+    # Wait up to 8s for password prompt — vCMTS/iCMTS both use TACACS which may take a moment
+    deadline = time.time() + 8
+    buf = ''
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if shell.recv_ready():
+            buf += shell.recv(8192).decode(errors='replace')
+        if 'password' in buf.lower() or 'password:' in buf.lower():
+            break
     if 'password' in buf.lower():
         shell.send(password + '\n')
-        time.sleep(1)
+        time.sleep(1.5)
         buf += shell.recv(8192).decode(errors='replace')
     shell.send(cmd + '\n')
     time.sleep(2)
@@ -679,7 +823,8 @@ def modem_info_collector(cfg):
     mac_dotted = _norm_mac_dotted(cfg['mac_norm'])
 
     if not jumpserver or not username or not cmts_host:
-        print('[CMTS] No jump server / CMTS host configured — skipping modem info')
+        missing = [k for k, v in [('jumpserver', jumpserver), ('username', username), ('cmts_host', cmts_host)] if not v]
+        print(f'[CMTS] Skipping modem info — missing config: {", ".join(missing)}')
         return None
 
     try:
@@ -779,7 +924,11 @@ def snmp_collector_thread(cfg, stop_event, csv_paths, poll_index_ref):
         return
     jumpserver = cfg['snmp_jumpserver']
     if not jumpserver:
-        print('[SNMP] No jumpserver configured')
+        print('[SNMP] No jumpserver configured — check SNMP_JUMPSERVER in .env')
+        return
+
+    if not cfg.get('target_ip'):
+        print(f'[SNMP] No target_ip for {cfg.get("mac_colon","?")} — modem IPv6 not resolved (CMTS_HOST={cfg.get("cmts_host") or "not set"})')
         return
 
     icmts_target = cfg.get('icmts_target', '')
@@ -790,13 +939,15 @@ def snmp_collector_thread(cfg, stop_event, csv_paths, poll_index_ref):
     if modem_info and session_dir:
         _write_modem_info_txt(session_dir, modem_info, cfg)
 
+    session_id = cfg.get('session_id', '')
+
     # Open CSV writers — prepend modem info comment block
     file_handles = {}
     writers = {}
     for key, path in csv_paths.items():
         fh = open(path, 'w', newline='')
         _write_modem_info_comments(fh, modem_info, cfg)
-        w  = csv.DictWriter(fh, fieldnames=SNMP_CSV_FIELDS)
+        w  = csv.DictWriter(fh, fieldnames=SNMP_DELTA_CSV_FIELDS, extrasaction='ignore')
         w.writeheader()
         file_handles[key] = fh
         writers[key] = w
@@ -806,65 +957,116 @@ def snmp_collector_thread(cfg, stop_event, csv_paths, poll_index_ref):
         # DS Latency/Congestion are sparse/AQM-only — not per-modem, store as-is
     }
 
+    def _run_poll(poll_idx, ts):
+        """Run one SNMP poll and return (us_rows, ds_rows)."""
+        modem_ip = cfg.get('target_ip', '')
+        if modem_ip and cfg['cmts_type'] == 'vcmts':
+            _, (us_cmds, us_lbls) = _icmts_snmp_commands(
+                '', modem_ip, cfg['icmts_community'], cfg['modem_community'],
+                cfg['snmp_timeout'], cfg['snmp_retries'], mac_decimal,
+            )
+            try:
+                us_results = _run_via_ssh(jumpserver, cfg['snmp_username'], us_cmds, us_lbls)
+            except Exception as e:
+                log.warning('[SNMP] SSH failed on poll %d: %s', poll_idx, e)
+                us_results = [(lbl, '') for lbl in us_lbls]
+            us_rows = _pivot_results(us_results, ts, poll_idx, modem_ip, 'modem_us', cfg['cmts_type'])
+            return us_rows, []
+        elif cfg.get('icmts_target') and modem_ip:
+            (ds_cmds, ds_lbls), (us_cmds, us_lbls) = _icmts_snmp_commands(
+                cfg['icmts_target'], modem_ip, cfg['icmts_community'], cfg['modem_community'],
+                cfg['snmp_timeout'], cfg['snmp_retries'], mac_decimal,
+            )
+            try:
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    f_us = ex.submit(_run_via_ssh, jumpserver, cfg['snmp_username'], us_cmds, us_lbls)
+                    f_ds = ex.submit(_run_via_ssh, jumpserver, cfg['snmp_username'], ds_cmds, ds_lbls)
+                    us_res, ds_res = f_us.result(), f_ds.result()
+            except Exception as e:
+                log.warning('[SNMP] SSH failed on poll %d: %s', poll_idx, e)
+                us_res = [(lbl, '') for lbl in us_lbls]
+                ds_res = [(lbl, '') for lbl in ds_lbls]
+            us_rows = _pivot_results(us_res, ts, poll_idx, modem_ip, 'modem_us', cfg['cmts_type'])
+            sf_index_out = next((o for l, o in ds_res if l == 'DS SF Index Table'), '')
+            sfid_ifindex = _extract_sfid_ifindex(sf_index_out, mac_decimal)
+            ds_rows = _pivot_results_ds(ds_res, ts, poll_idx, cfg['icmts_target'], cfg['cmts_type'], sfid_ifindex)
+            return us_rows, ds_rows
+        return [], []
+
+    def _write_rows(us_rows, ds_rows, phase='test'):
+        for row in us_rows:
+            row['phase'] = phase
+        for row in ds_rows:
+            row['phase'] = phase
+        _compute_snmp_deltas(us_rows, session_id)
+        for row in us_rows:
+            writers['us'].writerow(row)
+        file_handles['us'].flush()
+        if cfg.get('db_insert_snmp_delta'):
+            cfg['db_insert_snmp_delta'](us_rows)
+        if ds_rows:
+            _compute_snmp_deltas(ds_rows, session_id)
+            for row in ds_rows:
+                writers['ds'].writerow(row)
+            file_handles['ds'].flush()
+            if cfg.get('db_insert_snmp_ds_delta'):
+                cfg['db_insert_snmp_ds_delta'](ds_rows)
+
+    BASELINE_POLLS = cfg.get('baseline_polls', 3)
+    COOLDOWN_POLLS = cfg.get('cooldown_polls', 3)
+    phase_callback = cfg.get('phase_callback')
+
+    # Seed poll — prime counters so poll 1 has valid deltas
+    log.info('[SNMP] Seed poll — priming counters')
+    try:
+        seed_us, seed_ds = _run_poll(0, '')
+        _compute_snmp_deltas(seed_us, session_id)
+        _compute_snmp_deltas(seed_ds, session_id)
+    except Exception as e:
+        log.warning('[SNMP] Seed poll failed (non-fatal): %s', e)
+
+    # Baseline polls
+    log.info('[SNMP] Collecting %d baseline polls', BASELINE_POLLS)
+    for bp in range(1, BASELINE_POLLS + 1):
+        if stop_event.is_set():
+            break
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        log.info('[SNMP] Baseline poll %d/%d', bp, BASELINE_POLLS)
+        us_rows, ds_rows = _run_poll(poll_index_ref[0], ts)
+        poll_index_ref[0] += 1
+        _write_rows(us_rows, ds_rows, phase='baseline')
+        if bp < BASELINE_POLLS:
+            stop_event.wait(timeout=cfg['snmp_poll_interval'])
+
+    if phase_callback:
+        phase_callback('ready')
+    log.info('[SNMP] Baseline complete — ready to start test')
+    stop_event.wait(timeout=3)
+    if phase_callback:
+        phase_callback('running')
+    log.info('[SNMP] Collecting test data')
+
     try:
         while not stop_event.is_set():
             poll_idx = poll_index_ref[0]
             poll_index_ref[0] += 1
             ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-            print(f'[SNMP] Poll #{poll_idx}  {ts}')
-
-            modem_ip = cfg.get('target_ip', '')
-            if modem_ip and cfg['cmts_type'] == 'vcmts':
-                # vcmts: US SNMP only — DS comes from Kafka
-                _, (us_cmds, us_lbls) = _icmts_snmp_commands(
-                    '', modem_ip,
-                    cfg['icmts_community'], cfg['modem_community'],
-                    cfg['snmp_timeout'], cfg['snmp_retries'], mac_decimal,
-                )
-                try:
-                    ssh = _get_ssh(jumpserver, cfg['snmp_username'])
-                    us_results = _run_via_ssh(ssh, us_cmds, us_lbls)
-                    ssh.close()
-                except Exception as e:
-                    print(f'[SNMP] SSH failed: {e} — skipping US')
-                    us_results = [(lbl, '') for lbl in us_lbls]
-                us_rows = _pivot_results(us_results, ts, poll_idx,
-                                         modem_ip, 'modem_us', cfg['cmts_type'])
-                for row in us_rows:
-                    writers['us'].writerow(row)
-                file_handles['us'].flush()
-                print(f'[SNMP] Poll #{poll_idx} complete — US {len(us_rows)} sfids')
-
-            elif icmts_target and modem_ip:
-                (ds_cmds, ds_lbls), (us_cmds, us_lbls) = _icmts_snmp_commands(
-                    icmts_target, modem_ip,
-                    cfg['icmts_community'], cfg['modem_community'],
-                    cfg['snmp_timeout'], cfg['snmp_retries'], mac_decimal,
-                )
-                try:
-                    ssh = _get_ssh(jumpserver, cfg['snmp_username'])
-                    us_results = _run_via_ssh(ssh, us_cmds, us_lbls)
-                    ssh.close()
-                except Exception as e:
-                    print(f'[SNMP] SSH failed: {e} — skipping US')
-                    us_results = [(lbl, '') for lbl in us_lbls]
-                ds_results = _run_local(ds_cmds, ds_lbls)
-
-                us_rows = _pivot_results(us_results, ts, poll_idx,
-                                         modem_ip, 'modem_us', cfg['cmts_type'])
-                for row in us_rows:
-                    writers['us'].writerow(row)
-
-                ds_rows = _pivot_results(ds_results, ts, poll_idx,
-                                         icmts_target, 'icmts_ds', cfg['cmts_type'])
-                for row in ds_rows:
-                    writers['ds'].writerow(row)
-
-                file_handles['us'].flush()
-                file_handles['ds'].flush()
-                print(f'[SNMP] Poll #{poll_idx} complete — US {len(us_rows)} sfids  DS {len(ds_rows)} sfids')
-
+            log.info('[SNMP] Poll #%d  %s', poll_idx, ts)
+            us_rows, ds_rows = _run_poll(poll_idx, ts)
+            _write_rows(us_rows, ds_rows, phase='test')
+            log.info('[SNMP] Poll #%d complete — US %d sfids  DS %d sfids', poll_idx, len(us_rows), len(ds_rows))
             stop_event.wait(timeout=cfg['snmp_poll_interval'])
+
+        # Cooldown polls
+        log.info('[SNMP] Stop received — collecting %d cooldown polls', COOLDOWN_POLLS)
+        for cp in range(1, COOLDOWN_POLLS + 1):
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            log.info('[SNMP] Cooldown poll %d/%d', cp, COOLDOWN_POLLS)
+            us_rows, ds_rows = _run_poll(poll_index_ref[0], ts)
+            poll_index_ref[0] += 1
+            _write_rows(us_rows, ds_rows, phase='cooldown')
+            if cp < COOLDOWN_POLLS:
+                stop_event.wait(timeout=cfg['snmp_poll_interval'])
     finally:
         for fh in file_handles.values():
             fh.close()
@@ -895,7 +1097,8 @@ def kafka_collector_thread(cfg, stop_event, csv_path):
         print('[Kafka] kafka-python not installed — pip install kafka-python')
         return
 
-    mac_b_norm  = cfg['mac_norm'].encode('ascii')
+    # vCMTS Kafka messages use colon-formatted MAC (e.g. 60:6c:63:f1:98:88)
+    # mac_b_norm (no separators) never appears in raw messages — colon format is the only match
     mac_b_colon = cfg['mac_colon'].encode('ascii')
 
     try:
@@ -912,6 +1115,30 @@ def kafka_collector_thread(cfg, stop_event, csv_path):
 
     print(f'[Kafka] Connected  broker={cfg["kafka_broker"]}  '
           f'topic={cfg["kafka_topic"]}  mac={cfg["mac_colon"]}')
+
+    # Startup check — wait up to 2 poll intervals for at least one message for this MAC
+    log.info('[Kafka] Waiting for first message for MAC %s...', cfg['mac_colon'])
+    deadline = time.time() + cfg.get('snmp_poll_interval', 15) * 2
+    mac_seen = False
+    while time.time() < deadline and not stop_event.is_set():
+        batch = consumer.poll(timeout_ms=2000)
+        for tp, messages in batch.items():
+            for message in messages:
+                if mac_b_colon in message.value:
+                    mac_seen = True
+                    break
+            if mac_seen:
+                break
+        if mac_seen:
+            break
+    if not mac_seen:
+        err = f'Kafka: no messages received for {cfg["mac_colon"]} within {cfg.get("snmp_poll_interval", 15) * 2}s — vCMTS not publishing this modem'
+        log.error('[Kafka] %s', err)
+        if cfg.get('error_callback'):
+            cfg['error_callback'](err)
+        consumer.close()
+        return
+    log.info('[Kafka] MAC confirmed on Kafka stream — starting collection')
 
     # sfid lookup: (kafka_ts, dir, sfIndex) → sfid from K_Samis1_Sfid
     # params lookup: (dir, sfIndex) → {scn, max_rate_bps, aqm_target_msecs}
@@ -932,6 +1159,7 @@ def kafka_collector_thread(cfg, stop_event, csv_path):
             nonlocal count
             done = [k for k in pending
                     if current_ts is None or k[0] != current_ts]
+            flushed = []
             for key in done:
                 if key in written:
                     del pending[key]
@@ -944,35 +1172,55 @@ def kafka_collector_thread(cfg, stop_event, csv_path):
                 row.setdefault('max_rate_bps',   p.get('max_rate_bps', ''))
                 row.setdefault('aqm_target_msecs', p.get('aqm_target_msecs', ''))
                 writer.writerow(row)
+                flushed.append(row)
                 written.add(key)
                 count += 1
-            if done:
+            if flushed:
                 f.flush()
+                if cfg.get('db_insert_kafka'):
+                    cfg['db_insert_kafka'](flushed)
 
-        while not stop_event.is_set():
+        poll_interval = cfg.get('snmp_poll_interval', 15)
+
+        cooldown_polls = cfg.get('cooldown_polls', 3)
+        cooldown_secs = poll_interval * cooldown_polls
+        cooldown_deadline = None
+
+        while True:
+            if stop_event.is_set():
+                if cooldown_deadline is None:
+                    cooldown_deadline = time.time() + cooldown_secs
+                    log.info('[Kafka] Stop received — continuing %ds for cooldown', cooldown_secs)
+                if time.time() >= cooldown_deadline:
+                    break
             batch = consumer.poll(timeout_ms=2000)
             if not batch:
                 continue
             current_kafka_ts = None
             for tp, messages in batch.items():
                 for message in messages:
-                    if stop_event.is_set():
+                    if stop_event.is_set() and cooldown_deadline and time.time() >= cooldown_deadline:
                         break
                     raw = message.value
-                    if mac_b_norm not in raw and mac_b_colon not in raw:
+                    if mac_b_colon not in raw:
                         continue
                     line = raw.decode('utf-8', errors='replace').strip()
                     m = RE_PROM.match(line)
                     if not m:
+                        print(f'[Kafka] unmatched line: {line[:120]}')
                         continue
                     metric, labels_str, value, kafka_ts = m.groups()
                     if metric not in KAFKA_METRICS:
                         continue
                     labels = dict(re.findall(r'(\w+)="([^"]*)"', labels_str))
-                    dir_    = labels.get('dir', '')
-                    sfidx   = labels.get('sfIndex', '')
-                    key     = (kafka_ts, dir_, sfidx)
+                    dir_    = labels.get('dir', '') or labels.get('direction', '')
+                    sfidx   = labels.get('sfIndex', '') or labels.get('sfindex', '')
+                    key     = (kafka_ts, dir_, sfidx)  # dir_ ensures DS/US sfIndex collisions don't merge
                     current_kafka_ts = kafka_ts
+
+                    # Skip upstream flows — Kafka is DS only; US comes from SNMP
+                    if dir_.lower() in ('us', 'upstream'):
+                        continue
 
                     # K_DocsQos_Params — store rate/aqm/scn params, no row
                     if metric == 'K_DocsQos_Params':
@@ -1215,9 +1463,11 @@ def run_test_mode(cfg):
                 )
                 t0 = time.time()
                 try:
-                    ssh = _get_ssh(jumpserver, cfg['snmp_username'])
-                    us_results = _run_via_ssh(ssh, us_cmds, us_lbls)
-                    ssh.close()
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        f_us = ex.submit(_run_via_ssh, jumpserver, cfg['snmp_username'], us_cmds, us_lbls)
+                        f_ds = ex.submit(_run_via_ssh, jumpserver, cfg['snmp_username'], ds_cmds, ds_lbls)
+                        us_results = f_us.result()
+                        ds_results = f_ds.result()
                 except Exception as e:
                     print(f'  ✗ SSH failed: {e}')
                     us_results = [(lbl, '') for lbl in us_lbls]
@@ -1265,7 +1515,6 @@ def run_test_mode(cfg):
             if cfg['cmts_type'] == 'vcmts' and cfg.get('kafka_broker') and KAFKA_AVAILABLE:
                 print(f'  ── Kafka  {cfg["kafka_broker"]}  topic={cfg["kafka_topic"]} ──────────────────')
                 print()
-                mac_b_norm  = cfg['mac_norm'].encode('ascii')
                 mac_b_colon = cfg['mac_colon'].encode('ascii')
                 try:
                     consumer = KafkaConsumer(
@@ -1281,7 +1530,7 @@ def run_test_mode(cfg):
                         for tp, messages in consumer.poll(timeout_ms=1000).items():
                             for msg in messages:
                                 raw = msg.value
-                                if mac_b_norm not in raw and mac_b_colon not in raw:
+                                if mac_b_colon not in raw:
                                     continue
                                 line = raw.decode('utf-8', errors='replace').strip()
                                 if not any(m in line for m in KAFKA_METRICS):
