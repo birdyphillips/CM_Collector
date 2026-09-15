@@ -407,10 +407,11 @@ def _test_only(df):
 def page_summary(pdf, us, k_us, k_ds, **m):
     rows = []
 
-    # SNMP US — use delta_flow_octets for per-poll throughput
+    # SNMP US
     if us is not None and not us.empty:
         for sfid, grp in _test_only(us).groupby('sfid'):
             grp = grp.sort_values('captured_utc')
+            scn = grp['ps_scn'].dropna().iloc[-1] if 'ps_scn' in grp.columns and grp['ps_scn'].notna().any() else ''
             if 'delta_flow_octets' in grp.columns:
                 delta_oct = pd.to_numeric(grp['delta_flow_octets'], errors='coerce').clip(lower=0).sum()
                 dur_s = max((grp['captured_utc'].iloc[-1] - grp['captured_utc'].iloc[0]).total_seconds(), 1)
@@ -418,48 +419,50 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             else:
                 tp = 0
             lat_max = pd.to_numeric(grp.get('lat_max_usec', pd.Series()), errors='coerce').max()
-            lat_max_ms = lat_max / 1000 if pd.notna(lat_max) else 0
+            lat_max_ms = round(lat_max / 1000, 3) if pd.notna(lat_max) else 0
             bin_cols   = [f'lat_bin{i}' for i in range(1, 17)]
             delta_cols = [f'delta_lat_bin{i}' for i in range(1, 17)]
-            present    = [c for c in bin_cols if c in grp.columns]
             if all(c in grp.columns for c in delta_cols):
                 grp_d  = grp[grp['poll_index'] > grp['poll_index'].min()] if 'poll_index' in grp.columns else grp
                 deltas = [_toint(pd.to_numeric(grp_d[c], errors='coerce').clip(lower=0).sum()) for c in delta_cols]
-            elif present:
-                cum    = grp[present].apply(pd.to_numeric, errors='coerce')
+            elif [c for c in bin_cols if c in grp.columns]:
+                present = [c for c in bin_cols if c in grp.columns]
+                cum = grp[present].apply(pd.to_numeric, errors='coerce')
                 deltas = [_toint(cum[c].diff().clip(lower=0).sum()) for c in present]
             else:
                 deltas = []
-            if deltas:
-                p50  = _calc_percentile(deltas, 0.50)
-                p99  = _calc_percentile(deltas, 0.99)
-                p999 = _calc_percentile(deltas, 0.999)
-                wavg = _calc_weighted_avg(deltas)
-            else:
-                p50 = p99 = p999 = wavg = 0
-            aqm = pd.to_numeric(grp['delta_cong_aqm_drop'], errors='coerce').sum() if 'delta_cong_aqm_drop' in grp.columns else 0
-            ce  = pd.to_numeric(grp['delta_cong_ce_marked'], errors='coerce').sum() if 'delta_cong_ce_marked' in grp.columns else 0
-            rows.append((str(sfid), 'US', 'SNMP', round(tp, 3), round(wavg, 3),
-                         round(lat_max_ms, 3), p50, p99, p999, int(aqm), int(ce), 0.0))
+            p50  = _calc_percentile(deltas, 0.50)  if deltas else 0
+            p99  = _calc_percentile(deltas, 0.99)  if deltas else 0
+            p999 = _calc_percentile(deltas, 0.999) if deltas else 0
+            wavg = round(_calc_weighted_avg(deltas), 3) if deltas else 0
+            aqm    = int(pd.to_numeric(grp['delta_cong_aqm_drop'],   errors='coerce').sum()) if 'delta_cong_aqm_drop'   in grp.columns else 0
+            ce     = int(pd.to_numeric(grp['delta_cong_ce_marked'],  errors='coerce').sum()) if 'delta_cong_ce_marked'  in grp.columns else 0
+            ect0   = int(pd.to_numeric(grp['delta_cong_ect0'],       errors='coerce').sum()) if 'delta_cong_ect0'       in grp.columns else 0
+            ect1   = int(pd.to_numeric(grp['delta_cong_ect1'],       errors='coerce').sum()) if 'delta_cong_ect1'       in grp.columns else 0
+            policed= int(pd.to_numeric(grp['delta_flow_policed_drop'],errors='coerce').sum()) if 'delta_flow_policed_drop' in grp.columns else 0
+            rows.append((str(sfid), str(scn), 'US', 'SNMP',
+                         round(tp, 3), wavg, lat_max_ms, p50, p99, p999,
+                         aqm, ce, ect0, ect1, policed, 0.0))
 
-    # Kafka DS
+    # Kafka DS + US
     for kdf, direction, source in [(_test_only(k_ds), 'DS', 'Kafka'), (_test_only(k_us), 'US', 'Kafka')]:
         if kdf is None or kdf.empty:
             continue
         grp_col = 'sfid_label' if 'sfid_label' in kdf.columns else 'sfid'
-        for sfid, grp in kdf.groupby(grp_col):
-            grp = grp.sort_values('captured_utc')
+        for name, grp in kdf.groupby(grp_col):
+            grp  = grp.sort_values('captured_utc')
+            sfid = str(grp['sfid'].dropna().iloc[-1]) if 'sfid' in grp.columns and grp['sfid'].notna().any() else str(name)
+            scn  = str(grp['scn'].dropna().iloc[-1])  if 'scn'  in grp.columns and grp['scn'].notna().any()  else ''
             if 'delta_octets' in grp.columns:
                 delta_oct = pd.to_numeric(grp['delta_octets'], errors='coerce').clip(lower=0).sum()
                 dur_s = max((grp['captured_utc'].iloc[-1] - grp['captured_utc'].iloc[0]).total_seconds(), 1)
                 tp = delta_oct * 8 / dur_s / 1_000_000
             else:
                 tp = 0
-            # lat_avg_usec / lat_max_usec from vCMTS Kafka are already in ms
-            lat_avg = pd.to_numeric(grp.get('lat_avg_usec', pd.Series()), errors='coerce')
-            avg_lat_ms = lat_avg.mean() if not lat_avg.dropna().empty else 0
             lat_max = pd.to_numeric(grp.get('lat_max_usec', pd.Series()), errors='coerce').max()
-            lat_max_ms = lat_max if pd.notna(lat_max) else 0
+            lat_max_ms = round(float(lat_max), 3) if pd.notna(lat_max) else 0
+            lat_avg = pd.to_numeric(grp.get('lat_avg_usec', pd.Series()), errors='coerce')
+            wavg = round(lat_avg.mean(), 3) if not lat_avg.dropna().empty else 0
             bin_cols = [f'lat_bin{i}' for i in range(1, 17)]
             present  = [c for c in bin_cols if c in grp.columns]
             if present:
@@ -468,37 +471,43 @@ def page_summary(pdf, us, k_us, k_ds, **m):
                 p50  = _calc_percentile(deltas, 0.50)
                 p99  = _calc_percentile(deltas, 0.99)
                 p999 = _calc_percentile(deltas, 0.999)
-                wavg = _calc_weighted_avg(deltas)
             else:
-                p50 = p99 = p999 = wavg = avg_lat_ms
-            aqm = pd.to_numeric(grp['cong_aqm_drop'],  errors='coerce').diff().clip(lower=0).sum() if 'cong_aqm_drop'  in grp.columns else 0.0
-            ce  = pd.to_numeric(grp['cong_ce_marked'], errors='coerce').diff().clip(lower=0).sum() if 'cong_ce_marked' in grp.columns else 0.0
-            pkts_pass = pd.to_numeric(grp['delta_pkts'],         errors='coerce').sum() if 'delta_pkts'         in grp.columns else 0.0
-            pkts_drop = pd.to_numeric(grp['delta_pkts_dropped'], errors='coerce').sum() if 'delta_pkts_dropped' in grp.columns else 0.0
+                p50 = p99 = p999 = 0
+            aqm  = int(pd.to_numeric(grp['cong_aqm_drop'],  errors='coerce').diff().clip(lower=0).sum()) if 'cong_aqm_drop'  in grp.columns else 0
+            ce   = int(pd.to_numeric(grp['cong_ce_marked'], errors='coerce').diff().clip(lower=0).sum()) if 'cong_ce_marked' in grp.columns else 0
+            pkts_pass = pd.to_numeric(grp['delta_pkts'],         errors='coerce').sum() if 'delta_pkts'         in grp.columns else 0
+            pkts_drop = pd.to_numeric(grp['delta_pkts_dropped'], errors='coerce').sum() if 'delta_pkts_dropped' in grp.columns else 0
             total_pkts = pkts_pass + pkts_drop
-            loss_pct = (pkts_drop / total_pkts * 100) if total_pkts > 0 else 0.0
-            rows.append((str(sfid), direction, source, round(tp, 3), round(wavg, 3),
-                         round(lat_max_ms, 3), p50, p99, p999,
-                         int(aqm), int(ce), round(loss_pct, 3)))
+            loss_pct = round(pkts_drop / total_pkts * 100, 3) if total_pkts > 0 else 0.0
+            rows.append((sfid, scn, direction, source,
+                         round(tp, 3), wavg, lat_max_ms, p50, p99, p999,
+                         aqm, ce, 0, 0, 0, loss_pct))
 
     if not rows:
         return
 
     fig = plt.figure(figsize=(11, 8.5))
     fig.patch.set_facecolor(BG_DARK)
-    ax = fig.add_axes([0.03, 0.08, 0.94, 0.78])
+    ax = fig.add_axes([0.01, 0.06, 0.98, 0.80])
     ax.set_facecolor(BG_PANEL)
     ax.axis('off')
 
-    col_labels = ['SFID', 'Dir', 'Src', 'Mbps', 'WAvg\n(ms)', 'Max\n(ms)',
-                  'P50\nbin', 'P99\nbin', 'P99.9\nbin', 'AQM\nDrop', 'CE\nMark', 'Loss%']
-    col_widths  = [0.12, 0.06, 0.07, 0.08, 0.08, 0.08, 0.07, 0.07, 0.08, 0.08, 0.08, 0.07]
+    col_labels = ['SFID', 'SCN', 'Dir', 'Src',
+                  'Peak\nMbps', 'WAvg\nms', 'Max\nms',
+                  'P50\nbin', 'P99\nbin', 'P99.9\nbin',
+                  'AQM\nDrop', 'CE\nMark', 'ECT0', 'ECT1',
+                  'Policed\nDrop', 'Loss%']
+    col_widths  = [0.07, 0.10, 0.04, 0.05,
+                   0.06, 0.06, 0.06,
+                   0.05, 0.05, 0.06,
+                   0.06, 0.06, 0.05, 0.05,
+                   0.07, 0.05]
     tbl = ax.table(cellText=[[str(v) for v in r] for r in rows],
                    colLabels=col_labels, colWidths=col_widths,
                    loc='center', cellLoc='center')
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1, 1.6)
+    tbl.set_fontsize(7.5)
+    tbl.scale(1, 1.8)
     for col in range(len(col_labels)):
         cell = tbl[0, col]
         cell.set_facecolor(ACCENT)
@@ -511,11 +520,12 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             cell.set_text_props(color=TEXT_COLOR)
             cell.set_edgecolor(GRID_COLOR)
 
-    _sp = {k: m[k] for k in ('mac_fmt', 'modem_name', 'session_start', 'session_end')}
-    _sp['cmts_type'] = m.get('cmts_type', 'vcmts')
-    save_page(pdf, fig, ax, 'SESSION SUMMARY — THROUGHPUT & LATENCY',
-              f'{m["modem_name"]} ({m["mac_fmt"]})  |  Weighted Avg latency, P50/P99/P99.9 bin, AQM drops',
-              **_sp)
+    _sp2 = {k: m[k] for k in ('mac_fmt', 'modem_name', 'session_start', 'session_end')}
+    _sp2['cmts_type'] = m.get('cmts_type', 'vcmts')
+    save_page(pdf, fig, ax,
+              'SESSION SUMMARY — THROUGHPUT & LATENCY',
+              f'{m["modem_name"]} ({m["mac_fmt"]})  |  Peak Mbps, WAvg/Max latency, P50/P99/P99.9, AQM/CE/ECT/Policed drops',
+              **_sp2)
 
 
 # ---------------------------------------------------------------------------
