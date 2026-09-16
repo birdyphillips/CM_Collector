@@ -462,7 +462,8 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             lat_max = pd.to_numeric(grp.get('lat_max_usec', pd.Series()), errors='coerce').max()
             lat_max_ms = round(float(lat_max), 3) if pd.notna(lat_max) else 0
             lat_avg = pd.to_numeric(grp.get('lat_avg_usec', pd.Series()), errors='coerce')
-            wavg = round(lat_avg.mean(), 3) if not lat_avg.dropna().empty else 0
+            active_lat = lat_avg[lat_avg > 1.0]  # exclude idle polls (baseline/cooldown near zero)
+            wavg = round(active_lat.mean(), 3) if not active_lat.empty else 0
             bin_cols = [f'lat_bin{i}' for i in range(1, 17)]
             present  = [c for c in bin_cols if c in grp.columns]
             if present:
