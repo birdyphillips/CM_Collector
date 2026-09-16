@@ -297,7 +297,7 @@ def page_cover(pdf, mac_fmt, modem_name, session_start, session_end,
     ax.text(0.5, 0.935, f'{cmts_type.upper()} SNMP + KAFKA SESSION REPORT',
             transform=ax.transAxes, fontsize=26, fontweight='bold',
             color='white', ha='center', va='center')
-    ax.text(0.5, 0.865, 'Spectrum  •  Access Engineering  •  vCMTS EFT',
+    ax.text(0.5, 0.865, 'Spectrum  •  Access Engineering',
             transform=ax.transAxes, fontsize=12, color=TEXT_COLOR,
             ha='center', va='center', fontstyle='italic')
     ax.text(0.5, 0.815, session_name,
