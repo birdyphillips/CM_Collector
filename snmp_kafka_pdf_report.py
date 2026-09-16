@@ -396,7 +396,28 @@ def _calc_weighted_avg(deltas):
     return sum((i + 1) * v for i, v in enumerate(deltas)) / total
 
 
+# vCMTS fixed DS latency bin upper edges in ms
+VCMTS_BIN_EDGES_MS = [0.5, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40, 999]
+
+def _bin_to_ms(bin_num, edges=VCMTS_BIN_EDGES_MS):
+    """Convert 1-based bin number to upper edge ms string."""
+    if bin_num <= 0:
+        return '0'
+    idx = bin_num - 1
+    if idx < len(edges):
+        v = edges[idx]
+        return f'{v:.0f}ms' if v >= 1 else f'{v*1000:.0f}\u00b5s'
+    return f'{edges[-1]:.0f}ms+'
+
+
 def _test_only(df):
+    """Filter to test-phase rows only if phase column is populated, else return all."""
+    if 'phase' in df.columns and df['phase'].notna().any():
+        test = df[df['phase'] == 'test']
+        return test if not test.empty else df
+    return df
+
+
     """Filter to test-phase rows only if phase column is populated, else return all."""
     if 'phase' in df.columns and df['phase'].notna().any():
         test = df[df['phase'] == 'test']
@@ -469,11 +490,11 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             if present:
                 cum    = grp[present].apply(pd.to_numeric, errors='coerce')
                 deltas = [_toint(cum[c].diff().clip(lower=0).sum()) for c in present]
-                p50  = _calc_percentile(deltas, 0.50)
-                p99  = _calc_percentile(deltas, 0.99)
-                p999 = _calc_percentile(deltas, 0.999)
+                p50  = _bin_to_ms(_calc_percentile(deltas, 0.50))
+                p99  = _bin_to_ms(_calc_percentile(deltas, 0.99))
+                p999 = _bin_to_ms(_calc_percentile(deltas, 0.999))
             else:
-                p50 = p99 = p999 = 0
+                p50 = p99 = p999 = '0'
             aqm  = int(pd.to_numeric(grp['cong_aqm_drop'],  errors='coerce').diff().clip(lower=0).sum()) if 'cong_aqm_drop'  in grp.columns else 0
             ce   = int(pd.to_numeric(grp['cong_ce_marked'], errors='coerce').diff().clip(lower=0).sum()) if 'cong_ce_marked' in grp.columns else 0
             pkts_pass = pd.to_numeric(grp['delta_pkts'],         errors='coerce').sum() if 'delta_pkts'         in grp.columns else 0
@@ -495,7 +516,7 @@ def page_summary(pdf, us, k_us, k_ds, **m):
 
     col_labels = ['SFID', 'SCN', 'Dir', 'Src',
                   'Peak\nMbps', 'WAvg\nms', 'Max\nms',
-                  'P50\nbin', 'P99\nbin', 'P99.9\nbin',
+                  'P50\nms', 'P99\nms', 'P99.9\nms',
                   'AQM\nDrop', 'CE\nMark', 'ECT0', 'ECT1',
                   'Policed\nDrop', 'Loss%']
     col_widths  = [0.07, 0.10, 0.04, 0.05,
