@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -243,11 +244,12 @@ _UI = """<!DOCTYPE html>
   .status-err { background: #2a0d0d; border: 1px solid #ea4335; color: #ea4335; }
   .status-inf { background: #0d1e2a; border: 1px solid #1a73e8; color: #8ab4f8; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: auto; }
   th { text-align: left; padding: 10px 14px; color: var(--sub); font-weight: 600;
        font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
-       border-bottom: 1px solid var(--border); }
-  td { padding: 11px 14px; border-bottom: 1px solid #0d1b2a; vertical-align: middle; }
+       border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 11px 14px; border-bottom: 1px solid #0d1b2a; vertical-align: middle; word-break: break-word; }
+  td:last-child { min-width: 160px; width: 1%; white-space: nowrap; }
   tr:hover td { background: #0d1e30; }
 
   .badge {
@@ -263,7 +265,7 @@ _UI = """<!DOCTYPE html>
   .badge-stopped  { background: #1a1a2a; color: #8ab4f8; border: 1px solid #445; }
 
   .mac-cell { font-family: monospace; color: var(--sub); }
-  .action-cell { display: flex; gap: 8px; }
+  .action-cell { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
   .btn-sm {
     padding: 5px 14px;
@@ -1080,9 +1082,20 @@ def delete_session(session_id: str):
     s = _sessions.get(session_id)
     if s and s['status'] == 'running':
         raise HTTPException(400, 'Stop the session before deleting')
+    # Delete results folder
+    if s:
+        session_dir = s['cfg'].get('session_dir', '')
+        if session_dir and os.path.isdir(session_dir):
+            try:
+                shutil.rmtree(session_dir)
+                log.info('[%s] Deleted results dir: %s', session_id, session_dir)
+            except Exception as e:
+                log.warning('[%s] Could not delete results dir: %s', session_id, e)
     try:
         with _db() as con:
             con.execute('DELETE FROM sessions WHERE id=?', (session_id,))
+            for tbl in ('snmp_upstream_delta_rows', 'snmp_downstream_delta_rows', 'kafka_rows'):
+                con.execute(f'DELETE FROM {tbl} WHERE session_id=?', (session_id,))
     except Exception as e:
         raise HTTPException(500, f'DB error: {e}')
     _sessions.pop(session_id, None)
