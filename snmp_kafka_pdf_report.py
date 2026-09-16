@@ -413,9 +413,9 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             grp = grp.sort_values('captured_utc')
             scn = grp['ps_scn'].dropna().iloc[-1] if 'ps_scn' in grp.columns and grp['ps_scn'].notna().any() else ''
             if 'delta_flow_octets' in grp.columns:
-                delta_oct = pd.to_numeric(grp['delta_flow_octets'], errors='coerce').clip(lower=0).sum()
-                dur_s = max((grp['captured_utc'].iloc[-1] - grp['captured_utc'].iloc[0]).total_seconds(), 1)
-                tp = delta_oct * 8 / dur_s / 1_000_000
+                grp['interval_s'] = grp['captured_utc'].diff().dt.total_seconds().clip(lower=1)
+                grp['mbps'] = pd.to_numeric(grp['delta_flow_octets'], errors='coerce').clip(lower=0) * 8 / grp['interval_s'] / 1_000_000
+                tp = grp['mbps'].max()
             else:
                 tp = 0
             lat_max = pd.to_numeric(grp.get('lat_max_usec', pd.Series()), errors='coerce').max()
@@ -454,9 +454,9 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             sfid = str(grp['sfid'].dropna().iloc[-1]) if 'sfid' in grp.columns and grp['sfid'].notna().any() else str(name)
             scn  = str(grp['scn'].dropna().iloc[-1])  if 'scn'  in grp.columns and grp['scn'].notna().any()  else ''
             if 'delta_octets' in grp.columns:
-                delta_oct = pd.to_numeric(grp['delta_octets'], errors='coerce').clip(lower=0).sum()
-                dur_s = max((grp['captured_utc'].iloc[-1] - grp['captured_utc'].iloc[0]).total_seconds(), 1)
-                tp = delta_oct * 8 / dur_s / 1_000_000
+                grp['interval_s'] = grp['captured_utc'].diff().dt.total_seconds().clip(lower=1)
+                grp['mbps'] = pd.to_numeric(grp['delta_octets'], errors='coerce').clip(lower=0) * 8 / grp['interval_s'] / 1_000_000
+                tp = grp['mbps'].max()
             else:
                 tp = 0
             lat_max = pd.to_numeric(grp.get('lat_max_usec', pd.Series()), errors='coerce').max()
