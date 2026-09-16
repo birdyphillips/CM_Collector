@@ -290,7 +290,7 @@ _UI = """<!DOCTYPE html>
 <header>
   <div>
     <div class="logo">⬡ CM Collector</div>
-    <div class="sub">Charter Communications — Access Engineering  |  LLD Telemetry Collection</div>
+    <div class="sub">Spectrum — Access Engineering  |  LLD Telemetry Collection</div>
   </div>
 </header>
 

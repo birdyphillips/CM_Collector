@@ -177,7 +177,7 @@ def add_footer(fig, mac_fmt, modem_name, session_start, session_end, cmts_type='
     fax.set_facecolor('#0a1628')
     fax.axis('off')
     fax.text(0.5, 0.5,
-             f'{cmts_type.upper()} SNMP+Kafka Report  |  {modem_name} ({mac_fmt})  |  {session_start} — {session_end}  |  aphillips — Charter Access Engineering',
+             f'{cmts_type.upper()} SNMP+Kafka Report  |  {modem_name} ({mac_fmt})  |  {session_start} — {session_end}  |  aphillips — Spectrum Access Engineering',
              transform=fax.transAxes, fontsize=7, color='#445566', ha='center', va='center')
 
 def make_fig():
@@ -297,7 +297,7 @@ def page_cover(pdf, mac_fmt, modem_name, session_start, session_end,
     ax.text(0.5, 0.935, f'{cmts_type.upper()} SNMP + KAFKA SESSION REPORT',
             transform=ax.transAxes, fontsize=26, fontweight='bold',
             color='white', ha='center', va='center')
-    ax.text(0.5, 0.865, 'Charter Communications  •  Access Engineering  •  vCMTS EFT',
+    ax.text(0.5, 0.865, 'Spectrum  •  Access Engineering  •  vCMTS EFT',
             transform=ax.transAxes, fontsize=12, color=TEXT_COLOR,
             ha='center', va='center', fontstyle='italic')
     ax.text(0.5, 0.815, session_name,
@@ -327,7 +327,7 @@ def page_cover(pdf, mac_fmt, modem_name, session_start, session_end,
         y -= 0.057
 
     ax.text(0.5, 0.02,
-            f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}   |   aphillips — Charter Access Engineering',
+            f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}   |   aphillips — Spectrum Access Engineering',
             transform=ax.transAxes, fontsize=8, color='#445566', ha='center', va='center')
     pdf.savefig(fig, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -986,7 +986,7 @@ def main():
 
         d = pdf.infodict()
         d['Title']   = f'{cmts_type.upper()} SNMP+Kafka Report — {modem_name} ({mac_fmt})'
-        d['Author']  = 'aphillips — Charter Access Engineering'
+        d['Author']  = 'aphillips — Spectrum Access Engineering'
         d['Subject'] = session_name
 
     print(f'\nPDF saved: {out_path}')
