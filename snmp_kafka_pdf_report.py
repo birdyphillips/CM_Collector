@@ -808,6 +808,9 @@ def page_kafka_latency_histogram(pdf, kdf, direction, **m):
 
     has_bins = kdf[present].apply(pd.to_numeric, errors='coerce').notna().any(axis=1)
     for name, grp in kdf[has_bins].groupby(grp_col):
+        # Skip WiFi traffic flows
+        if 'WFT' in str(name).upper():
+            continue
         grp = grp.sort_values('captured_utc')
         last = grp.iloc[-1]
         # Diff cumulative bins across all rows, skip first (no baseline), sum all poll deltas
@@ -921,20 +924,19 @@ def main():
              test_start=test_start, cooldown_start=cooldown_start)
 
     toc = [
-        ('3',  'Session Summary',             'Throughput, weighted avg latency, P50/P99/P99.9 bin, AQM drops per SFID'),
-        ('4',  'US Flow Throughput',          'SNMP delta_flow_octets MB/poll per US service flow'),
+        ('3',  'Session Summary',             'SFID/SCN, Peak Mbps, WAvg/Max latency, P50/P99/P99.9, AQM/CE/ECT0/ECT1/Policed drops, Loss%'),
+        ('4',  'US Flow Throughput',          'SNMP delta_flow_octets → Mbps per US service flow'),
         ('5',  'US Policed Drop & Delay',     'SNMP policed drop and delay packet counts per US flow'),
         ('6',  'US AQM Dropped Packets',      'SNMP AQM drop counters per US service flow'),
         ('7',  'US Latency Max (ms)',          'SNMP peak latency per AQM-enabled US flow over time'),
-        ('8',  'US Latency Histogram',        'SNMP 16-bin latency distribution (last poll, per SFID)'),
+        ('8',  'US Latency Histogram',        'SNMP 16-bin latency distribution (all polls summed, per SFID)'),
         ('9',  'US Congestion — AQM & CE',    'SNMP AQM drops and CE marked packets per US flow'),
         ('10', 'US Param Set — Max Rate',     'SNMP active param set max rate (Mbps) per US flow'),
         ('11', 'DS Throughput (Mbps)',        'Kafka delta_octets → Mbps per DS flow'),
-        ('12', 'DS Latency Avg (ms)',         'Kafka average latency per DS flow (already in ms)'),
-        ('13', 'DS Latency Max (ms)',         'Kafka peak latency per DS flow (already in ms)'),
-        ('14', 'DS Latency Histogram',        'Kafka 16-bin latency distribution (last sample)'),
-        ('15', 'DS AQM Dropped Packets',      'Kafka aqm_drop_pkts per DS flow'),
-        ('16', 'DS AQM Marked Packets',       'Kafka aqm_marked_pkts per DS flow'),
+        ('12', 'DS Latency Avg (ms)',         'Kafka average latency per DS flow'),
+        ('13', 'DS Latency Histogram',        'Kafka 16-bin latency distribution (all polls summed, per SFID)'),
+        ('14', 'DS AQM Dropped Packets',      'Kafka AQM drop packets per DS flow'),
+        ('15', 'DS AQM Marked Packets',       'Kafka CE marked packets per DS flow'),
     ]
 
     safe_name = re.sub(r'[^\w\-]', '_', session_name).strip('_')
