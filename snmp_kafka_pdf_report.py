@@ -488,11 +488,7 @@ def page_summary(pdf, us, k_us, k_ds, **m):
             bin_cols = [f'lat_bin{i}' for i in range(1, 17)]
             present  = [c for c in bin_cols if c in grp.columns]
             if present:
-                # Only diff bins from active traffic polls to exclude baseline/cooldown
-                active_grp = grp[pd.to_numeric(grp.get('lat_avg_usec', pd.Series(dtype=float)), errors='coerce') > 1000] if 'lat_avg_usec' in grp.columns else grp
-                if active_grp.empty:
-                    active_grp = grp
-                cum    = active_grp[present].apply(pd.to_numeric, errors='coerce')
+                cum    = grp[present].apply(pd.to_numeric, errors='coerce')
                 deltas = [_toint(cum[c].diff().clip(lower=0).sum()) for c in present]
                 p50  = _bin_to_ms(_calc_percentile(deltas, 0.50))
                 p99  = _bin_to_ms(_calc_percentile(deltas, 0.99))
