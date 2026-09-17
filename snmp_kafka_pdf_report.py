@@ -671,16 +671,7 @@ def page_us_latency_histogram(pdf, us, **m):
         # Build x-axis labels from lat_edge_bin values (in µs → ms) — bins 1-16
         edge_cols = [f'lat_edge_bin{i}' for i in range(1, 17)]
         edges_us  = [pd.to_numeric(last.get(c), errors='coerce') for c in edge_cols]
-        def _us_to_ms_label(v):
-            if pd.isna(v):
-                return '?'
-            ms = v / 1000
-            return f'{ms:.3f}ms' if ms < 1 else f'{ms:.0f}ms'
-        x_labels = []
-        for i in range(len(present)):
-            lo = '0' if i == 0 else _us_to_ms_label(edges_us[i - 1])
-            hi = _us_to_ms_label(edges_us[i]) if pd.notna(edges_us[i]) else '+'
-            x_labels.append(f'{lo}–{hi}')
+        x_labels = [f'Bin {i+1}' for i in range(len(present))]
 
         fig, ax = make_fig()
         x = range(len(present))
@@ -821,14 +812,7 @@ def page_kafka_latency_histogram(pdf, kdf, direction, **m):
     _kw['cmts_type'] = m.get('cmts_type', 'vcmts')
 
     # vCMTS fixed DS bin edges in ms (bin N covers prev_edge – this_edge)
-    VCMTS_BIN_EDGES_MS = [0.5, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40]
-    def _ms_label(v):
-        return f'{v:.0f}ms' if v >= 1 else f'{v*1000:.0f}µs'
-    x_labels = []
-    for i in range(len(present)):
-        lo = '0' if i == 0 else _ms_label(VCMTS_BIN_EDGES_MS[i - 1])
-        hi = _ms_label(VCMTS_BIN_EDGES_MS[i]) if i < len(VCMTS_BIN_EDGES_MS) else '+'
-        x_labels.append(f'{lo}–{hi}')
+    x_labels = [f'Bin {i+1}' for i in range(len(present))]
 
     has_bins = kdf[present].apply(pd.to_numeric, errors='coerce').notna().any(axis=1)
     for name, grp in kdf[has_bins].groupby(grp_col):
