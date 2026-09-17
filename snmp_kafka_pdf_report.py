@@ -16,6 +16,8 @@ import sys
 import re
 import json
 import sqlite3
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — required when called from threads
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -673,7 +675,7 @@ def page_us_latency_histogram(pdf, us, **m):
             if pd.isna(v):
                 return '?'
             ms = v / 1000
-            return f'{ms:.0f}ms' if ms >= 1 else f'{v:.0f}µs'
+            return f'{ms:.3f}ms' if ms < 1 else f'{ms:.0f}ms'
         x_labels = []
         for i in range(len(present)):
             lo = '0' if i == 0 else _us_to_ms_label(edges_us[i - 1])
@@ -794,7 +796,7 @@ def page_kafka_latency(pdf, kdf, direction, **m):
         if col not in kdf.columns or pd.to_numeric(kdf[col], errors='coerce').dropna().empty:
             continue
         df = kdf.copy()
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = pd.to_numeric(df[col], errors='coerce') / 1000  # µs → ms
         # Filter out SFIDs with no latency data (all zeros)
         active = df.groupby(grp_col)[col].max()
         active_labels = active[active.fillna(0) > 0].index
@@ -805,7 +807,7 @@ def page_kafka_latency(pdf, kdf, direction, **m):
         plot_line(ax, df, col, grp_col, 'Latency (ms)')
         _annotate(ax, m)
         save_page(pdf, fig, ax, title,
-                  f'{m["modem_name"]} ({m["mac_fmt"]})  |  vCMTS Kafka (ms)', **_kw)
+                  f'{m["modem_name"]} ({m["mac_fmt"]})  |  vCMTS Kafka µs→ms', **_kw)
 
 
 def page_kafka_latency_histogram(pdf, kdf, direction, **m):
@@ -840,9 +842,9 @@ def page_kafka_latency_histogram(pdf, kdf, direction, **m):
         bins = [int(cum[c].diff().clip(lower=0).sum()) for c in present]
         lat_max = pd.to_numeric(grp['lat_max_usec'].max(), errors='coerce') if 'lat_max_usec' in grp.columns else float('nan')
         lat_avg = pd.to_numeric(grp['lat_avg_usec'], errors='coerce').mean() if 'lat_avg_usec' in grp.columns else float('nan')
-        subtitle = f'All polls summed'
-        if pd.notna(lat_max):
-            subtitle += f'  |  avg={lat_avg:.1f}ms  max={lat_max:.1f}ms'
+        subtitle = 'All polls summed'
+        if pd.notna(lat_max) and lat_max > 0:
+            subtitle += f'  |  avg={lat_avg/1000:.2f}ms  max={lat_max/1000:.2f}ms'
         fig, ax = make_fig()
         x = range(len(present))
         bars = ax.bar(x, bins, color=ACCENT, edgecolor=BG_DARK, linewidth=0.5, width=0.7)
@@ -903,6 +905,84 @@ def page_kafka_congestion(pdf, kdf, direction, **m):
         _annotate(ax, m)
         save_page(pdf, fig, ax, title,
                   f'{m["modem_name"]} ({m["mac_fmt"]})  |  Kafka delta per poll', **_kw)
+
+
+# ---------------------------------------------------------------------------
+# API-callable entry point
+# ---------------------------------------------------------------------------
+def generate_report(session_id: str, session_name: str, conn) -> str:
+    """Generate PDF for a session and return the output path. No prompts."""
+    sessions = _list_sessions(conn)
+    row = sessions[sessions['id'].str.startswith(session_id)]
+    if row.empty:
+        raise ValueError(f'Session not found: {session_id}')
+    sid  = row.iloc[0]['id']
+    meta = row.iloc[0]
+    us         = _load_snmp(conn, sid)
+    k_us, k_ds = _load_kafka(conn, sid)
+    test_start, cooldown_start = _get_phase_times(conn, sid)
+
+    cmts_type  = meta['cmts_type']
+    mac_fmt    = meta['mac']
+    modem_name = MODEM_NAMES.get(mac_fmt, mac_fmt)
+
+    all_times = pd.concat([
+        us['captured_utc'] if not us.empty else pd.Series(dtype='datetime64[ns]'),
+        k_ds['captured_utc'] if not k_ds.empty else pd.Series(dtype='datetime64[ns]'),
+    ]).dropna()
+    if all_times.empty:
+        raise ValueError('No data rows found for this session')
+
+    session_start = all_times.min().strftime('%Y-%m-%d %H:%M UTC')
+    session_end   = all_times.max().strftime('%Y-%m-%d %H:%M UTC')
+    duration_secs = int((all_times.max() - all_times.min()).total_seconds())
+    hours, rem    = divmod(duration_secs, 3600)
+    duration_str  = f'{hours}h {rem // 60}m'
+    total_polls   = us['poll_index'].nunique() if 'poll_index' in us.columns else len(us)
+    us_sfids = sorted(us['sfid'].unique(), key=lambda x: int(x) if str(x).isdigit() else 0) if not us.empty else []
+    ds_sfids = sorted(k_ds['sfid'].unique(), key=lambda x: int(x) if str(x).isdigit() else 0) if not k_ds.empty else []
+
+    m = dict(mac_fmt=mac_fmt, modem_name=modem_name,
+             session_start=session_start, session_end=session_end,
+             cmts_type=cmts_type, test_start=test_start, cooldown_start=cooldown_start)
+
+    toc = [
+        ('3',  'Session Summary',         'SFID/SCN, Peak Mbps, WAvg/Max latency, P50/P99/P99.9, AQM/CE/ECT/Policed drops, Loss%'),
+        ('4',  'US Flow Throughput',      'SNMP delta_flow_octets → Mbps per US service flow'),
+        ('5',  'US Policed Drop & Delay', 'SNMP policed drop and delay packet counts per US flow'),
+        ('6',  'US AQM Dropped Packets',  'SNMP AQM drop counters per US service flow'),
+        ('7',  'US Latency Histogram',    'SNMP 16-bin latency distribution (all polls summed, per SFID)'),
+        ('8',  'US Congestion — AQM & CE','SNMP AQM drops and CE marked packets per US flow'),
+        ('9',  'DS Throughput (Mbps)',    'Kafka delta_octets → Mbps per DS flow'),
+        ('10', 'DS Latency Avg (ms)',     'Kafka average latency per DS flow'),
+        ('11', 'DS Latency Histogram',    'Kafka 16-bin latency distribution (all polls summed, per SFID)'),
+        ('12', 'DS AQM Dropped Packets',  'Kafka AQM drop packets per DS flow'),
+        ('13', 'DS AQM Marked Packets',   'Kafka CE marked packets per DS flow'),
+    ]
+
+    safe_name   = re.sub(r'[^\w\-]', '_', session_name).strip('_')
+    reports_dir = os.path.join(HERE, 'reports')
+    os.makedirs(reports_dir, exist_ok=True)
+    out_path = os.path.join(reports_dir, f'report_{cmts_type}_{sid[:8]}_{safe_name}.pdf')
+
+    with PdfPages(out_path) as pdf:
+        page_cover(pdf, mac_fmt, modem_name, session_start, session_end,
+                   duration_str, total_polls, us_sfids, ds_sfids, cmts_type, session_name, sid)
+        page_toc(pdf, mac_fmt, modem_name, session_start, session_end, toc, cmts_type)
+        page_summary(pdf, us, k_us, k_ds, **m)
+        page_us_flow_stats(pdf, us, **m)
+        page_us_latency_histogram(pdf, us, **m)
+        page_us_congestion(pdf, us, **m)
+        page_kafka_throughput(pdf, k_ds, 'downstream', **m)
+        page_kafka_latency(pdf, k_ds, 'downstream', **m)
+        page_kafka_latency_histogram(pdf, k_ds, 'downstream', **m)
+        page_kafka_congestion(pdf, k_ds, 'downstream', **m)
+        d = pdf.infodict()
+        d['Title']   = f'{cmts_type.upper()} SNMP+Kafka Report — {modem_name} ({mac_fmt})'
+        d['Author']  = 'aphillips — Spectrum Access Engineering'
+        d['Subject'] = session_name
+
+    return out_path
 
 
 # ---------------------------------------------------------------------------
